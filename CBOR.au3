@@ -1,5 +1,15 @@
 #include-once
 
+;  Oriented on RFC 8949, but does not claim to be fully implemented.
+;  https://www.rfc-editor.org/rfc/rfc8949.html
+
+; not implemented yet:
+; - tags (to mark date/time strings etc.)
+; - bytewise lexicographic order of the map-keys
+; - UINT64, bigfloats, bignums etc. due to the lack of corresponding autoit datatypes
+; - indefinite length for arrays, maps, byte strings and text strings
+; - "undefined" - is mapped to/from "Default"-keyword
+
 
 Func _cbor_decode(ByRef $dInput, $iCurPos = 1)
 
@@ -13,7 +23,6 @@ Func _cbor_decode(ByRef $dInput, $iCurPos = 1)
 	Local $bIndefinite = False
 	Switch $iAddInfo
 		Case 0 To 23
-			ConsoleWrite(@TAB & $iAddInfo & @CRLF)
 			;  $iAddInfo = $iAddInfo
 		Case 24 To 27 ; following 1,2,4,8 Bytes
 			$iAddInfoLen = 2^($iAddInfo-24)
@@ -23,20 +32,18 @@ Func _cbor_decode(ByRef $dInput, $iCurPos = 1)
 			Return SetError(2, $iAddInfo, Null) ; exception: no valid value for additional info - not defined in bcor standard yet - only reserved for later
 		Case 31 ; indefinite-length array or map (currently not supported)
 			$bIndefinite = True
-			Return SetError(3, $iAddInfo, Null)
 			;  If ($dInitByte < 2) Or ($dInitByte = 6) Then Return SetError(3, $dInitByte, Null) ; exception: invalid combination of major type and additional info
-		Case Else ; should not be possible to appear
-			Return SetError(-1, $iAddInfo, Null)
-	EndSwitch
+			Return SetError(3, $iAddInfo, Null)
+	EndSwitch ; no case else because all possible values are handled (5 bits = 0..31)
 
 
 	; handle the different element types
 	Switch $iMajorType
 		Case 0 ; unsigned int          - no content
-			If $iAddInfoLen > 1 Then $iAddInfo = __cbor_reverseBytes($iAddInfo, 1, $iAddInfoLen)
+			If $iAddInfoLen > 1 Then $iAddInfo = _cbor_swapEndianess($iAddInfo)
 			Return SetExtended($dNextPos, Int($iAddInfo))
 		Case 1 ; negative unsigned int - no content
-			$iAddInfo = __cbor_reverseBytes($iAddInfo, 1, $iAddInfoLen)
+			If $iAddInfoLen > 1 Then $iAddInfo = _cbor_swapEndianess($iAddInfo)
 			Return SetExtended($dNextPos, -1 - Int($iAddInfo))
 		Case 2 ; byte string           - N bytes
 			Return SetExtended($dNextPos + $iAddInfo, BinaryMid($dInput, $dNextPos, $iAddInfo))
@@ -80,52 +87,30 @@ Func _cbor_decode(ByRef $dInput, $iCurPos = 1)
 						; should return a special value which can be used to detect the indefinite length end in array or map branch
 						Return SetError(3, $iAddInfo, Null)
 					Case Else
-					;  Case Else ; unassigned(0..19) reserved (24..31) and unassigned (32..255) values
+					; unassigned(0..19) reserved (24..31) and unassigned (32..255) values
 				EndSwitch
 			Else ; float type (32 or 64 Bit IEEE754 - 16 Bit is not supported here)
+				$iAddInfo = _cbor_swapEndianess($iAddInfo)
+
 				Switch $iAddInfoLen
 					Case 2 ; half float
-						; swap bytes:
-						ConsoleWrite($iAddInfo & @CRLF)
-						$iAddInfo = BinaryMid(Binary(BitAnd(BitShift($iAddInfo, 8), 255) + BitShift(BitAnd($iAddInfo, 255), -8)), 1, 2)
-						ConsoleWrite($iAddInfo & @CRLF)
 						Return SetExtended($dNextPos, __cbor_hpToFloat($iAddInfo))
 					Case 4 ; float
 						Local $tTmp = DllStructCreate("Byte[4]")
 						DllStructSetData($tTmp, 1, $iAddInfo)
 
-						; swap byte order:
-						Local $iPosTarget = 4, $iPosSource
-						For $iPosSource = 1 To 4
-							DllStructSetData($tTmp, 1, BinaryMid($iAddInfo, $iPosSource, 1), $iPosTarget)
-							$iPosTarget -= 1
-						Next
-
 						; convert the raw bytes
 						Local $tFloat = DllStructCreate("FLOAT", DllStructGetPtr($tTmp))
-						Local $vValue = DllStructGetData($tFloat, 1)
-						$tTmp = Null
-						$tFloat = Null
 
-						Return SetExtended($dNextPos, $vValue)
+						Return SetExtended($dNextPos, DllStructGetData($tFloat, 1))
 					Case 8 ; double
 						Local $tTmp = DllStructCreate("Byte[8]")
 						DllStructSetData($tTmp, 1, $iAddInfo)
 
-						; swap byte order:
-						Local $iPosTarget = 8, $iPosSource
-						For $iPosSource = 1 To 8
-							DllStructSetData($tTmp, 1, BinaryMid($iAddInfo, $iPosSource, 1), $iPosTarget)
-							$iPosTarget -= 1
-						Next
-
 						; convert the raw bytes
 						Local $tFloat = DllStructCreate("DOUBLE", DllStructGetPtr($tTmp))
-						Local $vValue = DllStructGetData($tFloat, 1)
-						$tTmp = Null
-						$tFloat = Null
 
-						Return SetExtended($dNextPos, $vValue)
+						Return SetExtended($dNextPos, DllStructGetData($tFloat, 1))
 					Case Else
 						Return SetError(6, $iAddInfoLen, Null) ; exception: no valid float type (half-float, float or double)
 				EndSwitch
@@ -142,32 +127,42 @@ Func _cbor_encode(ByRef $vInput)
 
 EndFunc
 
-; reverse byte order in a hex-form binary-string or directly in a binary
-Func __cbor_reverseBytes($vBytes, $iStart = 1, $iLen = -1)
-	If IsString($vBytes) Then ; string form
-		Local $sSubString = StringMid($vBytes, $iStart, $iLen)
-		Local $sReturn = $iStart = 1 ? "" : StringLeft($vBytes, $iStart - 1)
-		Local $aPairs = StringRegExp($sSubString, '[[:xdigit:]]{2}', 3)
-		If @error Then Return SetError(2, @error, Null)
+; change the endianess of a binary from big-endian to little-endian (windows-endianess) - or vice versa
+Func _cbor_swapEndianess($dBig)
+    Local Static $hDll = DllOpen("ws2_32.dll")
 
-		For $i = UBound($aPairs) - 1 To 0 Step -1
-			$sReturn &= $aPairs[$i]
-		Next
-		Return $sReturn
-	ElseIf IsBinary($vBytes) Then
-		Local $dSubBytes = BinaryMid($vBytes, $iStart)
-		Local $iSubLen = BinaryLen($dSubBytes)
+    Switch BinaryLen($dBig)
+        Case 2
+            Local $aRet = DllCall($hDll, "USHORT", "ntohs", "USHORT", $dBig)
+            Return @error ? SetError(2, @error, Null) : BinaryMid($aRet[0], 1, 2)            ;  BinaryMid(Binary(BitAnd(BitShift($dBig, 8), 255) + BitShift(BitAnd($dBig, 255), -8)), 1, 2)
+        Case 4
+            Local $aRet = DllCall($hDll, "ULONG", "ntohl", "ULONG", $dBig)
+            Return @error ? SetError(2, @error, Null) : Number($aRet[0], 1)
+        Case 8
+            Local $aRetHigh = DllCall($hDll, "ULONG", "ntohl", "ULONG", BinaryMid($dBig, 1, 4))
+            IF @error Then Return SetError(3, @error, Null)
 
-		Local $tBytes = DllStructCreate("BYTE[" & $iSubLen & "]")
-		Local $iTargetPos = $iSubLen
-		For $i = 1 To $iSubLen
-			DllStructSetData($tBytes, 1, BinaryMid($dSubBytes, $i, 1), $iTargetPos)
-			$iTargetPos -= 1
-		Next
-		Return DllStructGetData($tBytes, 1)
-	Else
-		Return SetError(1,0,Null)
-	EndIf
+            Local $aRetLow = DllCall($hDll, "ULONG", "ntohl", "ULONG", BinaryMid($dBig, 5, 4))
+            IF @error Then Return SetError(4, @error, Null)
+
+            Local $t64Bit = DllStructCreate("ULONG;ULONG")
+            DllStructSetData($t64Bit, 1, $aRetLow[0])
+            DllStructSetData($t64Bit, 2, $aRetHigh[0])
+
+            Local $tReturn = DllStructCreate("UINT64", DllStructGetPtr($t64Bit))
+            Return DllStructGetData($tReturn, 1)
+
+        Case Else
+            Local $iLen = BinaryLen($dBig)
+
+            Local $tBytes = DllStructCreate("BYTE[" & $iLen & "]")
+            Local $iTargetPos = $iLen, $i
+            For $i = 1 To $iLen
+                DllStructSetData($tBytes, 1, BinaryMid($dBig, $i, 1), $iTargetPos)
+                $iTargetPos -= 1
+            Next
+            Return DllStructGetData($tBytes, 1)
+    EndSwitch
 EndFunc
 
 
