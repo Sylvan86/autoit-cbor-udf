@@ -1,17 +1,60 @@
 #include-once
 
-;  Oriented on RFC 8949, but does not claim to be fully implemented.
-;  https://www.rfc-editor.org/rfc/rfc8949.html
+; #INDEX# =======================================================================================================================
+; Title .........: CBOR-UDF
+; Version .......: 0.1
+; AutoIt Version : 3.3.16.1
+; Language ......: english (german maybe by accident)
+; Description ...: functions encoding AutoIt-variables into CBOR-formatted binary and vice versa
+; Author(s) .....: AspirinJunkie
+; Last changed ..: 2023-02-07
+; Remarks .......: The UDF is oriented on RFC 8949, but does not claim to be fully implemented. (https://www.rfc-editor.org/rfc/rfc8949.html)
+;                  especially these CBOR-features are not not implemented yet:
+;                     - tags (to mark date/time strings etc.) - tag elements are simply ignored
+;                     - bytewise lexicographic order of the map-keys
+;                     - UINT64, bigfloats, bignums etc. due to the lack of corresponding autoit datatypes
+;                     - indefinite length for arrays, maps, byte strings and text strings - in this case the conversion fails
+;                     - "undefined" - is mapped to/from "Default"-keyword because AutoIt don't know a "undefined"-keyword
+; ===============================================================================================================================
 
-; not implemented yet:
-; - tags (to mark date/time strings etc.)
-; - bytewise lexicographic order of the map-keys
-; - UINT64, bigfloats, bignums etc. due to the lack of corresponding autoit datatypes
-; - indefinite length for arrays, maps, byte strings and text strings
-; - "undefined" - is mapped to/from "Default"-keyword
+; #Function list# =======================================================================================================================
+; ---- import and export from or to cbor ------
+;  _cbor_encode              - converts a (nested) AutoIt data structure into a CBOR binary
+;  _cbor_decode              - converts a CBOR binary into a (nested) AutoIt data structure
+;
+; ---- Thematically related helper functions ---------
+; __cbor_FloatToFP16         - convert a AutoIt-float-variable into a IEE 754 16-Bit floating point number
+; __cbor_floatToFP32         - convert a AutoIt-float-variable into a IEE 754 32-Bit floating point number
+; __cbor_FP16ToFP64          - convert a IEE 754 16-Bit floating point number into a AutoIt-float-variable
+; __cbor_swapEndianess       - swaps the endianess of a binary (little-endian to big-endian and vice-versa)
+; __cbor_A2DToAinA           - converts a 2D array into a Arrays in Array
+;
+; ---- purely supportive functions ----
+; __cbor_StructToBin         - create a binary variable out of a AutoIt-DllStruct
+; __cbor_encodeNum           - builds the initial byte[s] of a cbor-element and the structure
+; ===============================================================================================================================
 
 
-Func _cbor_decode(ByRef $dInput, $iCurPos = 1)
+
+
+
+
+; #FUNCTION# ======================================================================================
+; Name ..........: _cbor_decode
+; Description ...: converts a CBOR binary into a (nested) AutoIt data structure
+; Syntax ........: _cbor_decode($dInput [$iCurPos = 1])
+; Parameters ....: $dInput        - a CBOR formatted binary
+;                  [$iCurPos]     - don't touch - for internal recursive processing
+; Return values .: Success - Return a nested structure of AutoIt-datatypes
+;                       @extended = next byte index / binary len of $dInput
+;                  Failure - Return Null and set @error to:
+;        				@error = 1 - no valid value for additional info - not defined in bcor standard yet - only reserved for later
+;                              = 2 - invalid combination of major type and additional info
+;                              = 3 - indefinite length is not supported yet
+;                              = 4 - no valid float type (half-float, float or double)
+; Author ........: AspirinJunkie
+; =================================================================================================
+Func _cbor_decode($dInput, $iCurPos = 1)
 	Local $dInitByte = BinaryMid($dInput, $iCurPos, 1)
 	Local $iMajorType = Int(Bitshift($dInitByte, 5)) ; only 0-7 possible - so no extra range check
 	Local $dNextPos = $iCurPos + 1
@@ -22,22 +65,22 @@ Func _cbor_decode(ByRef $dInput, $iCurPos = 1)
 	Local $bIndefinite = False
 	Switch $iAddInfo
 		Case 0 To 23
-			;  $iAddInfo = $iAddInfo+
+			;  $iAddInfo = $iAddInfo
 			;  $iAddInfoLen = 0
 		Case 24 ; following byte
 			$iAddInfoLen = 1
-			$iAddInfo = BinaryMid($dInput, $dNextPos, 1)
+			$iAddInfo = Int(BinaryMid($dInput, $dNextPos, 1))
 			$dNextPos += 1
 		Case 25 To 27 ; following 2,4,8 Bytes
 			$iAddInfoLen = 2^($iAddInfo-24)
-			$iAddInfo = __cbor_swapEndianess(BinaryMid($dInput, $dNextPos, $iAddInfoLen)) ; cbor is big-endian but Windows (Intel) is little-endian
+			$iAddInfo = Int(__cbor_swapEndianess(BinaryMid($dInput, $dNextPos, $iAddInfoLen))) ; cbor is big-endian but Windows (Intel) is little-endian
 			$dNextPos += $iAddInfoLen
 		Case 28 To 30
-			Return SetError(2, $iAddInfo, Null) ; exception: no valid value for additional info - not defined in bcor standard yet - only reserved for later
+			Return SetError(1, $iAddInfo, Null) ; exception: no valid value for additional info - not defined in bcor standard yet - only reserved for later
 		Case 31 ; indefinite-length array or map (currently not supported)
 			$bIndefinite = True
 			;  If ($dInitByte < 2) Or ($dInitByte = 6) Then Return SetError(3, $dInitByte, Null) ; exception: invalid combination of major type and additional info
-			Return SetError(3, $iAddInfo, Null)
+			Return SetError(2, $iAddInfo, Null)
 	EndSwitch ; no case else because all possible values are handled (5 bits = 0..31)
 
 	; handle the different element types
@@ -112,15 +155,26 @@ Func _cbor_decode(ByRef $dInput, $iCurPos = 1)
 
 						Return SetExtended($dNextPos, DllStructGetData($tFloat, 1))
 					Case Else
-						Return SetError(6, $iAddInfoLen, Null) ; exception: no valid float type (half-float, float or double)
+						Return SetError(4, $iAddInfoLen, Null) ; exception: no valid float type (half-float, float or double)
 				EndSwitch
 			EndIf
 	EndSwitch
 EndFunc
 
 
-
-Func _cbor_encode($vObject, $i_Level = 0)
+; #FUNCTION# ======================================================================================
+; Name ..........: _cbor_encode
+; Description ...: converts a (nested) AutoIt data structure into a CBOR binary
+; Syntax ........: _cbor_encode($vObject)
+; Parameters ....: $vObject       - (nested) AutoIt data structure (integer/float/string/binary/bool/keyword/array(1D/2D)/map/dictionary)
+; Return values .: Success - Return a CBOR-formatted binary
+;                       @extended = next byte index / binary len of $dInput
+;                  Failure - Return Null and set @error to:
+;        				@error = 1 - invalid dimensions of array - only 1D or 2D-arrays are allowed (but nested arrays are possible)
+;                              = 2 - unsupported variable type
+; Author ........: AspirinJunkie
+; =================================================================================================
+Func _cbor_encode($vObject)
 	Switch VarGetType($vObject)
 		Case "String"
 			Local $bString = StringToBinary($vObject, 4) ; must be UTF-8 in CBOR
@@ -129,7 +183,7 @@ Func _cbor_encode($vObject, $i_Level = 0)
 			If $iBinLen = 0 Then Return BinaryMid(0x60, 1, 1)
 
 			; build the whole element structure (initial element byte + size information + data)
-			$tRet = __cbor_encodeNum($iBinLen, 3, ";BYTE[" & $iBinLen & "]")
+			Local $tRet = __cbor_encodeNum($iBinLen, 3, ";BYTE[" & $iBinLen & "]")
 			Local $iDataIndex = @extended > 0 ? 3 : 2
 			DllStructSetData($tRet, $iDataIndex, $bString)
 
@@ -282,6 +336,8 @@ Func _cbor_encode($vObject, $i_Level = 0)
 			Local $aBinElements[$nElements][2]
 			Local $tRet, $vKey, $bKey, $bValue
 
+			If $nElements = 0 Then Return BinaryMid(0xA0, 1, 1)
+
 			; encode all elements:
 			Local $tagElements = "", $i = 0
 			For $vKey In MapKeys($vObject)
@@ -308,20 +364,31 @@ Func _cbor_encode($vObject, $i_Level = 0)
 			Next
 
 			Return __cbor_StructToBin($tRet)
+		Case Else
+			Return SetError(2, 0, Null)
 	EndSwitch
 EndFunc
 
-
-
-
-; change the endianess of a binary from big-endian to little-endian (windows-endianess) - or vice versa
+; #FUNCTION# ======================================================================================
+; Name ..........: __cbor_swapEndianess
+; Description ...: swaps the endianess of a binary (little-endian to big-endian and vice-versa)
+; Syntax ........: __cbor_swapEndianess($dBig)
+; Parameters ....: $dBig       - binary which should be converted
+; Return values .: Success     - Return a binary with swapped endianess
+;                  Failure      - Return Null and set @error to:
+;        				@error = 1 - error during calling ntohs
+;                              = 2 - error during calling ntohl
+;                              = 3 - error during calling ntohl processing the higher bytes of 64 Bit-data
+;                              = 4 - error during calling ntohl processing the lower bytes of 64 Bit-data
+; Author ........: AspirinJunkie
+; =================================================================================================
 Func __cbor_swapEndianess($dBig)
     Local Static $hDll = DllOpen("ws2_32.dll")
 
     Switch BinaryLen($dBig)
         Case 2
             Local $aRet = DllCall($hDll, "USHORT", "ntohs", "USHORT", $dBig)
-            Return @error ? SetError(2, @error, Null) : BinaryMid($aRet[0], 1, 2)            ;  BinaryMid(Binary(BitAnd(BitShift($dBig, 8), 255) + BitShift(BitAnd($dBig, 255), -8)), 1, 2)
+            Return @error ? SetError(1, @error, Null) : BinaryMid($aRet[0], 1, 2)            ;  BinaryMid(Binary(BitAnd(BitShift($dBig, 8), 255) + BitShift(BitAnd($dBig, 255), -8)), 1, 2)
         Case 4
             Local $aRet = DllCall($hDll, "ULONG", "ntohl", "ULONG", $dBig)
             Return @error ? SetError(2, @error, Null) : Number($aRet[0], 1)
@@ -352,13 +419,28 @@ Func __cbor_swapEndianess($dBig)
     EndSwitch
 EndFunc
 
+; #FUNCTION# ======================================================================================
+; Name ..........: __cbor_StructToBin
+; Description ...: create a binary variable out of a AutoIt-DllStruct
+; Syntax ........: __cbor_StructToBin(ByRef $tStruct)
+; Parameters ....: $tStruct    - DllStruct where you want the binary expression from
+; Return values .: Success     - Return a binary with the dllstruct-content as data
+; Author ........: AspirinJunkie
+; =================================================================================================
 Func __cbor_StructToBin(ByRef $tStruct)
 	Local $tReturn = DllStructCreate("Byte[" & DllStructGetSize($tStruct) & "]", DllStructGetPtr($tStruct))
 	Return DllStructGetData($tReturn, 1)
 EndFunc
 
-; take 2 binary bytes and interprete them as IEEE 754 half precision float (FP16) and convert this to FP64 (Double)
-; https://www.researchgate.net/publication/362275548_Accuracy_and_performance_of_the_lattice_Boltzmann_method_with_64-bit_32-bit_and_customized_16-bit_number_formats
+; #FUNCTION# ======================================================================================
+; Name ..........: __cbor_FP16ToFP64
+; Description ...: convert a IEE 754 16-Bit floating point number into a AutoIt-float-variable
+; Syntax ........: __cbor_FP16ToFP64($dBin)
+; Parameters ....: $dBin    - 2Byte Binary (or anything convertible into that) with IEEE754-FP16-formatted float-number
+; Return values .: Success     - Return a AutoIt float variable
+; Author ........: AspirinJunkie
+; Remarks .......: Algorithm based on this paper: https://www.researchgate.net/publication/362275548_Accuracy_and_performance_of_the_lattice_Boltzmann_method_with_64-bit_32-bit_and_customized_16-bit_number_formats
+; =================================================================================================
 Func __cbor_FP16ToFP64($dBin)
 	$dBin = Int($dBin, 1)
 
@@ -387,8 +469,15 @@ Func __cbor_FP16ToFP64($dBin)
 	Return  DllStructGetData($tFloat, 1)
 EndFunc
 
-; take float variable and convert it to FP16-Format
-; https://www.researchgate.net/publication/362275548_Accuracy_and_performance_of_the_lattice_Boltzmann_method_with_64-bit_32-bit_and_customized_16-bit_number_formats
+; #FUNCTION# ======================================================================================
+; Name ..........: __cbor_FloatToFP16
+; Description ...: take float variable and convert it to IEEE754 FP16-Format
+; Syntax ........: __cbor_FloatToFP16($vNumber)
+; Parameters ....: $vNumber - AutoIt float-variable
+; Return values .: Success  - Return a 2-Byte binary with number in IEEE754 FP16-format
+; Author ........: AspirinJunkie
+; Remarks .......: Algorithm based on this paper: https://www.researchgate.net/publication/362275548_Accuracy_and_performance_of_the_lattice_Boltzmann_method_with_64-bit_32-bit_and_customized_16-bit_number_formats
+; =================================================================================================
 Func __cbor_FloatToFP16($vNumber)
 	; like a union in C: same data - different interpretation:
 	Local $tULONG = DllStructCreate("ULONG")
@@ -411,17 +500,33 @@ Func __cbor_FloatToFP16($vNumber)
 	Return BinaryMid($iReturn, 1, 2)
 EndFunc
 
+; #FUNCTION# ======================================================================================
+; Name ..........: __cbor_FloatToFP32
+; Description ...: convert a AutoIt-float-variable into a IEE 754 32-Bit floating point number
+; Syntax ........: __cbor_FloatToFP32($vDouble)
+; Parameters ....: $vDouble - AutoIt double-variable
+; Return values .: Success  - Return the value of a FP32-Float-variable
+; Author ........: AspirinJunkie
+; =================================================================================================
 Func __cbor_FloatToFP32($vDouble)
 	Local $tFloat = DllStructCreate("FLOAT")
 	DllStructSetData($tFloat, 1, $vDouble)
 	Return DllStructGetData($tFloat, 1)
 EndFunc
 
-
-; helper function for building the initial byte[s] of a cbor-element
+; #FUNCTION# ======================================================================================
+; Name ..........: __cbor_encodeNum
+; Description ...: helper function for building the initial byte[s] of a cbor-element
+; Syntax ........: __cbor_encodeNum($iNum, $iMajortype [, $sTagAdditional = ""])
+; Parameters ....: $iNum           - number of elements which should be encoded in cbor-style
+;                  $iMajortype     - 0..7 = CBOR major types
+;                  $sTagAdditional - additional dll-struct-definition to build the whole element struct
+; Return values .: Success  - DllStruct to be used as cbor-element
+; Author ........: AspirinJunkie
+; =================================================================================================
 Func __cbor_encodeNum($iNum, $iMajortype, $sTagAdditional = "")
 	Local $bCborFirst = BitShift($iMajortype, -5)
-	Local $iExt = 0
+	Local $iExt = 0, $tRet
 
 	;  encode the number of elements
 	Switch $iNum
