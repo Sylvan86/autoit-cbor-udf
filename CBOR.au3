@@ -12,7 +12,6 @@
 
 
 Func _cbor_decode(ByRef $dInput, $iCurPos = 1)
-
 	Local $dInitByte = BinaryMid($dInput, $iCurPos, 1)
 	Local $iMajorType = Int(Bitshift($dInitByte, 5)) ; only 0-7 possible - so no extra range check
 	Local $dNextPos = $iCurPos + 1
@@ -31,7 +30,7 @@ Func _cbor_decode(ByRef $dInput, $iCurPos = 1)
 			$dNextPos += 1
 		Case 25 To 27 ; following 2,4,8 Bytes
 			$iAddInfoLen = 2^($iAddInfo-24)
-			$iAddInfo = _cbor_swapEndianess(BinaryMid($dInput, $dNextPos, $iAddInfoLen)) ; cbor is big-endian but Windows (Intel) is little-endian
+			$iAddInfo = __cbor_swapEndianess(BinaryMid($dInput, $dNextPos, $iAddInfoLen)) ; cbor is big-endian but Windows (Intel) is little-endian
 			$dNextPos += $iAddInfoLen
 		Case 28 To 30
 			Return SetError(2, $iAddInfo, Null) ; exception: no valid value for additional info - not defined in bcor standard yet - only reserved for later
@@ -121,15 +120,202 @@ EndFunc
 
 
 
+Func _cbor_encode($vObject, $i_Level = 0)
+	Switch VarGetType($vObject)
+		Case "String"
+			Local $bString = StringToBinary($vObject, 4) ; must be UTF-8 in CBOR
+			Local $iBinLen = BinaryLen($bString)
 
+			If $iBinLen = 0 Then Return BinaryMid(0x60, 1, 1)
 
+			; build the whole element structure (initial element byte + size information + data)
+			$tRet = __cbor_encodeNum($iBinLen, 3, ";BYTE[" & $iBinLen & "]")
+			Local $iDataIndex = @extended > 0 ? 3 : 2
+			DllStructSetData($tRet, $iDataIndex, $bString)
 
-Func _cbor_encode(ByRef $vInput)
+			Return __cbor_StructToBin($tRet)
+		Case "Int32", "Int64"
+			Local $bNeg = $vObject < 0 ? True : False
 
+			If $bNeg Then $vObject = -$vObject - 1
+			Local $bCborFirst = $bNeg ? 0x20 : 0x0
+
+			If $vObject < 24 Then
+				$bCborFirst += $vObject
+				Return BinaryMid($bCborFirst, 1, 1)
+			ElseIf $vObject < 0x101 Then  ; 1 Byte
+				$bCborFirst += 24
+				Local $tRet = DllStructCreate("BYTE;BYTE")
+			ElseIf $vObject < 0x10001 Then ; 2 Byte
+				$bCborFirst += 25
+				Local $tRet = DllStructCreate("BYTE;BYTE[2]")
+			ElseIf $vObject < 0x100000001 Then ; 4 Byte
+				$bCborFirst += 26
+				Local $tRet = DllStructCreate("BYTE;BYTE[4]")
+			Else ; 8 Byte
+				$bCborFirst += 27
+				Local $tRet = DllStructCreate("BYTE;BYTE[8]")
+			EndIf
+			DllStructSetData($tRet, 1, $bCborFirst)
+			DllStructSetData($tRet, 2, $vObject)
+			Return __cbor_StructToBin($tRet)
+
+		Case "Float", "Double"
+			Local $bCborFirst = 0xE0
+			Local $fFP64 = Number($vObject, 3)
+			Local $fFP32 = __cbor_FloatToFP32($vObject)
+
+			If $fFP64 <> $fFP32 Then ; FP64
+				$bCborFirst += 27
+
+				Local $tRet = DllStructCreate("BYTE;BYTE[8]")
+				Local $tFloat = DllStructCreate("DOUBLE", DllStructGetPtr($tRet, 2))
+				DllStructSetData($tFloat, 1, $fFP64)
+				DllStructSetData($tRet, 2, __cbor_swapEndianess(DllStructGetData($tRet, 2)))
+			Else
+				Local $bFP16 = __cbor_FloatToFP16($vObject)
+				Local $fFP16 = __cbor_FP16ToFP64($bFP16)
+
+				If $fFP32 <> $fFP16 Then ; FP32
+					$bCborFirst += 26
+
+					Local $tRet = DllStructCreate("BYTE;BYTE[4]")
+					Local $tFloat = DllStructCreate("FLOAT", DllStructGetPtr($tRet, 2))
+					DllStructSetData($tFloat, 1, $fFP32)
+					DllStructSetData($tRet, 2, __cbor_swapEndianess(DllStructGetData($tRet, 2)))
+				Else ; FP 16
+					$bCborFirst += 25
+
+					Local $tRet = DllStructCreate("BYTE;BYTE[2]")
+					DllStructSetData($tRet, 2, __cbor_swapEndianess($bFP16))
+				EndIf
+			EndIf
+			DllStructSetData($tRet, 1, $bCborFirst)
+			Return __cbor_StructToBin($tRet)
+
+		Case "Bool"
+			Return $vObject ? BinaryMid(0xF5, 1, 1) : BinaryMid(0xF4, 1, 1)
+
+		Case "Keyword"
+			Return IsKeyword($vObject) = 2 ? BinaryMid(0xF6, 1, 1) : BinaryMid(0xF7, 1, 1)    ; ? null : Default/undefined
+
+		Case "Binary"
+			Local $iBinLen = BinaryLen($vObject)
+			If $iBinLen = 0 Then Return BinaryMid(0x40, 1, 1)
+
+			; build the whole element structure (initial element byte + size information + data)
+			$tRet = __cbor_encodeNum($iBinLen, 2, ";BYTE[" & $iBinLen & "]")
+			Local $iDataIndex = @extended > 0 ? 3 : 2
+			DllStructSetData($tRet, $iDataIndex, $vObject)
+			Return __cbor_StructToBin($tRet)
+
+		Case "Array"
+			If UBound($vObject, 0) > 2 Then Return SetError(1, UBound($vObject, 0), Null)
+			If UBound($vObject, 0) = 2 Then $vObject = __cbor_A2DToAinA($vObject)
+			Local $nElements = UBound($vObject)
+			Local $aBinElements[$nElements]
+			Local $bElement
+
+			If $nElements = 0 Then Return BinaryMid(0x80, 1, 1)
+
+			; encode all elements:
+			Local $tagElements = ""
+			For $i = 0 To $nElements - 1
+				$bElement = _cbor_encode($vObject[$i])
+				If @error Then Return SetError(@error, @extended, Null)
+				$aBinElements[$i] = $bElement
+				$tagElements &= ";BYTE" & (BinaryLen($bElement) > 1 ? "[" & BinaryLen($bElement) & "]" : "" )
+			Next
+
+			; build the whole element structure (initial element byte + size information + data)
+			Local $tRet = __cbor_encodeNum($nElements, 4, $tagElements)
+			Local $iOffset = @extended > 0 ? 3 : 2
+
+			; write elements
+			For $i = 0 To $nElements - 1
+				DllStructSetData($tRet, $i + $iOffset, $aBinElements[$i])
+			Next
+
+			Return __cbor_StructToBin($tRet)
+
+		Case "Object"
+			If ObjName($vObject) = "Dictionary" Then
+				Local $nElements = $vObject.Count()
+				If $nElements = 0 Then Return BinaryMid(0xA0, 1, 1)
+
+				Local $aBinElements[$nElements][2]
+				Local $tRet, $vKey, $bKey, $bValue
+
+				; encode all elements:
+				Local $tagElements = "", $i = 0
+				;  For $vKey In MapKeys($vObject)
+				For $vKey In $vObject.Keys
+					$bKey = _cbor_encode($vKey)
+					If @error Then Return SetError(@error, @extended, Null)
+					$bValue = _cbor_encode($vObject($vKey))
+					If @error Then Return SetError(@error, @extended, Null)
+					$aBinElements[$i][0] = $bKey
+					$aBinElements[$i][1] = $bValue
+
+					$tagElements &= ";BYTE" & (BinaryLen($bKey) > 1 ? "[" & BinaryLen($bKey) & "]" : "" ) & _
+									";BYTE" & (BinaryLen($bValue) > 1 ? "[" & BinaryLen($bValue) & "]" : "" )
+					$i += 1
+				Next
+
+				; build the whole element structure (initial element byte + size information + data)
+				$tRet = __cbor_encodeNum($nElements, 5, $tagElements)
+				Local $iOffset = @extended > 0 ? 3 : 2
+
+				; write elements
+				For $i = 0 To $nElements - 1
+					DllStructSetData($tRet, $i + $i + $iOffset, $aBinElements[$i][0])
+					DllStructSetData($tRet, $i + $i + 1 + $iOffset, $aBinElements[$i][1])
+				Next
+
+				Return __cbor_StructToBin($tRet)
+			Else
+				Return SetError(2, 0, Null)
+			EndIf
+
+		Case "Map"
+			Local $nElements = UBound($vObject)
+			Local $aBinElements[$nElements][2]
+			Local $tRet, $vKey, $bKey, $bValue
+
+			; encode all elements:
+			Local $tagElements = "", $i = 0
+			For $vKey In MapKeys($vObject)
+				$bKey = _cbor_encode($vKey)
+				If @error Then Return SetError(@error, @extended, Null)
+				$bValue = _cbor_encode($vObject[$vKey])
+				If @error Then Return SetError(@error, @extended, Null)
+				$aBinElements[$i][0] = $bKey
+				$aBinElements[$i][1] = $bValue
+
+				$tagElements &= ";BYTE" & (BinaryLen($bKey) > 1 ? "[" & BinaryLen($bKey) & "]" : "" ) & _
+								";BYTE" & (BinaryLen($bValue) > 1 ? "[" & BinaryLen($bValue) & "]" : "" )
+				$i += 1
+			Next
+
+			; build the whole element structure (initial element byte + size information + data)
+			$tRet = __cbor_encodeNum($nElements, 5, $tagElements)
+			Local $iOffset = @extended > 0 ? 3 : 2
+
+			; write elements
+			For $i = 0 To $nElements - 1
+				DllStructSetData($tRet, $i + $i + $iOffset, $aBinElements[$i][0])
+				DllStructSetData($tRet, $i + $i + 1 + $iOffset, $aBinElements[$i][1])
+			Next
+
+			Return __cbor_StructToBin($tRet)
+	EndSwitch
 EndFunc
 
+
+
+
 ; change the endianess of a binary from big-endian to little-endian (windows-endianess) - or vice versa
-Func _cbor_swapEndianess($dBig)
+Func __cbor_swapEndianess($dBig)
     Local Static $hDll = DllOpen("ws2_32.dll")
 
     Switch BinaryLen($dBig)
@@ -166,8 +352,13 @@ Func _cbor_swapEndianess($dBig)
     EndSwitch
 EndFunc
 
+Func __cbor_StructToBin(ByRef $tStruct)
+	Local $tReturn = DllStructCreate("Byte[" & DllStructGetSize($tStruct) & "]", DllStructGetPtr($tStruct))
+	Return DllStructGetData($tReturn, 1)
+EndFunc
 
 ; take 2 binary bytes and interprete them as IEEE 754 half precision float (FP16) and convert this to FP64 (Double)
+; https://www.researchgate.net/publication/362275548_Accuracy_and_performance_of_the_lattice_Boltzmann_method_with_64-bit_32-bit_and_customized_16-bit_number_formats
 Func __cbor_FP16ToFP64($dBin)
 	$dBin = Int($dBin, 1)
 
@@ -197,6 +388,7 @@ Func __cbor_FP16ToFP64($dBin)
 EndFunc
 
 ; take float variable and convert it to FP16-Format
+; https://www.researchgate.net/publication/362275548_Accuracy_and_performance_of_the_lattice_Boltzmann_method_with_64-bit_32-bit_and_customized_16-bit_number_formats
 Func __cbor_FloatToFP16($vNumber)
 	; like a union in C: same data - different interpretation:
 	Local $tULONG = DllStructCreate("ULONG")
@@ -218,3 +410,88 @@ Func __cbor_FloatToFP16($vNumber)
 	)
 	Return BinaryMid($iReturn, 1, 2)
 EndFunc
+
+Func __cbor_FloatToFP32($vDouble)
+	Local $tFloat = DllStructCreate("FLOAT")
+	DllStructSetData($tFloat, 1, $vDouble)
+	Return DllStructGetData($tFloat, 1)
+EndFunc
+
+
+; helper function for building the initial byte[s] of a cbor-element
+Func __cbor_encodeNum($iNum, $iMajortype, $sTagAdditional = "")
+	Local $bCborFirst = BitShift($iMajortype, -5)
+	Local $iExt = 0
+
+	;  encode the number of elements
+	Switch $iNum
+		Case 0 ; empty
+			Return SetExtended($iExt, BinaryMid($bCborFirst, 1, 1))
+		Case 1 To 23 ; direct count
+			$bCborFirst += $iNum
+			$tRet = DllStructCreate("BYTE" & $sTagAdditional)
+			$iExt = 0
+		Case 24 To 0x100 ; 1 Byte
+			$bCborFirst += 24
+			$tRet = DllStructCreate("BYTE;BYTE" & $sTagAdditional)
+			DllStructSetData($tRet, 2, $iNum)
+			$iExt = 1
+		Case 0x101 To 0x10000 ; 2 Byte
+			$bCborFirst += 25
+			$tRet = DllStructCreate("BYTE;BYTE[2]" & $sTagAdditional)
+			DllStructSetData($tRet, 2, __cbor_swapEndianess(BinaryMid($iNum, 1, 2)))
+			$iExt = 2
+		Case 0x10001 To 0x100000000 ; 4 Byte
+			$bCborFirst += 26
+			$tRet = DllStructCreate("BYTE;BYTE[4]" & $sTagAdditional)
+			DllStructSetData($tRet, 2, __cbor_swapEndianess(BinaryMid($iNum, 1, 2)))
+			$iExt = 4
+		Case Else ; 8 Byte
+			$bCborFirst += 27
+			$tRet = DllStructCreate("BYTE;BYTE[8]" & $sTagAdditional)
+			DllStructSetData($tRet, 2, __cbor_swapEndianess(BinaryMid($iNum, 1, 2)))
+			$iExt = 8
+	EndSwitch
+	DllStructSetData($tRet, 1, $bCborFirst)
+
+	Return SetExtended($iExt, $tRet)
+EndFunc
+
+; #FUNCTION# ======================================================================================
+; Name ..........: __cbor_A2DToAinA()
+; Description ...: Convert a 2D array into a Arrays in Array
+; Syntax ........: __cbor_A2DToAinA(ByRef $A)
+; Parameters ....: $A             - the 2D-Array  which should be converted
+; Return values .: Success: a Arrays in Array build from the input array
+;                  Failure: False
+;                     @error = 1: $A is'nt an 2D array
+; Author ........: AspirinJunkie
+; =================================================================================================
+Func __cbor_A2DToAinA(ByRef $A, $bTruncEmpty = True)
+	If UBound($A, 0) <> 2 Then Return SetError(1, UBound($A, 0), False)
+	Local $N = UBound($A), $u = UBound($A, 2)
+	Local $a_Ret[$N]
+
+	IF $bTruncEmpty Then
+		For $i = 0 To $N - 1
+			Local $x = $u -1
+			While IsString($A[$i][$x]) And $A[$i][$x] = ""
+				$x -= 1
+			WEnd
+			Local $t[$x+1]
+			For $j = 0 To $x
+				$t[$j] = $A[$i][$j]
+			Next
+			$a_Ret[$i] = $t
+		Next
+	Else
+		For $i = 0 To $N - 1
+			Local $t[$u]
+			For $j = 0 To $u - 1
+				$t[$j] = $A[$i][$j]
+			Next
+			$a_Ret[$i] = $t
+		Next
+	EndIf
+	Return $a_Ret
+EndFunc   ;==>__cbor_A2DToAinA
