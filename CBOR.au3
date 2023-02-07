@@ -19,14 +19,19 @@ Func _cbor_decode(ByRef $dInput, $iCurPos = 1)
 
 	; read out the additional info:
 	Local $iAddInfo = Int(BitAND($dInitByte, 31))
-	Local $iAddInfoLen = 1
+	Local $iAddInfoLen = 0
 	Local $bIndefinite = False
 	Switch $iAddInfo
 		Case 0 To 23
-			;  $iAddInfo = $iAddInfo
-		Case 24 To 27 ; following 1,2,4,8 Bytes
+			;  $iAddInfo = $iAddInfo+
+			;  $iAddInfoLen = 0
+		Case 24 ; following byte
+			$iAddInfoLen = 1
+			$iAddInfo = BinaryMid($dInput, $dNextPos, 1)
+			$dNextPos += 1
+		Case 25 To 27 ; following 2,4,8 Bytes
 			$iAddInfoLen = 2^($iAddInfo-24)
-			$iAddInfo = BinaryMid($dInput, $dNextPos, $iAddInfoLen)
+			$iAddInfo = _cbor_swapEndianess(BinaryMid($dInput, $dNextPos, $iAddInfoLen)) ; cbor is big-endian but Windows (Intel) is little-endian
 			$dNextPos += $iAddInfoLen
 		Case 28 To 30
 			Return SetError(2, $iAddInfo, Null) ; exception: no valid value for additional info - not defined in bcor standard yet - only reserved for later
@@ -36,14 +41,11 @@ Func _cbor_decode(ByRef $dInput, $iCurPos = 1)
 			Return SetError(3, $iAddInfo, Null)
 	EndSwitch ; no case else because all possible values are handled (5 bits = 0..31)
 
-
 	; handle the different element types
 	Switch $iMajorType
 		Case 0 ; unsigned int          - no content
-			If $iAddInfoLen > 1 Then $iAddInfo = _cbor_swapEndianess($iAddInfo)
 			Return SetExtended($dNextPos, Int($iAddInfo))
 		Case 1 ; negative unsigned int - no content
-			If $iAddInfoLen > 1 Then $iAddInfo = _cbor_swapEndianess($iAddInfo)
 			Return SetExtended($dNextPos, -1 - Int($iAddInfo))
 		Case 2 ; byte string           - N bytes
 			Return SetExtended($dNextPos + $iAddInfo, BinaryMid($dInput, $dNextPos, $iAddInfo))
@@ -59,21 +61,22 @@ Func _cbor_decode(ByRef $dInput, $iCurPos = 1)
 			Return SetExtended($dNextPos, $aArray)
 		Case 5 ; map                   - 2 N data items (key/value pairs)
 			; Todo: If $bIndefinite Then --> indefinite length map
-			Local $mMap[], $sKey, $vVal
+			Local $mMap[], $vKey, $vVal
 			For $i = 0 To $iAddInfo - 1
-				$sKey = _cbor_decode($dInput, $dNextPos)
+				$vKey = _cbor_decode($dInput, $dNextPos)
 				$dNextPos = @extended
 
 				$vVal = _cbor_decode($dInput, $dNextPos)
 				$dNextPos = @extended
 
-				$mMap[$sKey] = $vVal
+				$mMap[$vKey] = $vVal
 			Next
 			Return SetExtended($dNextPos, $mMap)
 		case 6 ; tag of number N       - 1 data item
-			;  ConsoleWrite("Type: " & "tag of number N" & @CRLF)
+			; just ignore the tag value:
+			Return _cbor_decode($dInput, $dNextPos)
 		case 7 ; simple / float        - no content
-				If $iAddInfoLen = 1 AND Int($iAddInfo) < 32 Then ; simple type
+				If $iAddInfoLen = 0 AND Int($iAddInfo) < 32 Then ; simple type
 				Switch Int(BitAND($dInitByte, 31))
 					Case 20
 						Return SetExtended($dNextPos, False)
@@ -89,12 +92,10 @@ Func _cbor_decode(ByRef $dInput, $iCurPos = 1)
 					Case Else
 					; unassigned(0..19) reserved (24..31) and unassigned (32..255) values
 				EndSwitch
-			Else ; float type (32 or 64 Bit IEEE754 - 16 Bit is not supported here)
-				$iAddInfo = _cbor_swapEndianess($iAddInfo)
-
+			Else ; float type (16, 32 or 64 Bit IEEE754)
 				Switch $iAddInfoLen
 					Case 2 ; half float
-						Return SetExtended($dNextPos, __cbor_hpToFloat($iAddInfo))
+						Return SetExtended($dNextPos, __cbor_FP16ToFP64($iAddInfo))
 					Case 4 ; float
 						Local $tTmp = DllStructCreate("Byte[4]")
 						DllStructSetData($tTmp, 1, $iAddInfo)
@@ -166,28 +167,54 @@ Func _cbor_swapEndianess($dBig)
 EndFunc
 
 
-; take 2 binary bytes and interprete them as IEEE 754 half precision float (FP16)
-Func __cbor_hpToFloat($dBin)
-	; Todo: special exponents: 00000 = zero/-0; 11111 = +-infinity, NaN
-	Local $iSign = BitShift(BitAND($dBin, 32768), 15)
-	Local $iExponent = BitAnd(BitShift($dBin, 10), 31) - 15
-    Local $iFraction = BitAnd($dBin, 1023)
+; take 2 binary bytes and interprete them as IEEE 754 half precision float (FP16) and convert this to FP64 (Double)
+Func __cbor_FP16ToFP64($dBin)
+	$dBin = Int($dBin, 1)
 
-    Local $fFraction = 1, $fCurVal = 0.0009765625, $iCurBitVal = 1, $i
+	; like a union in C: same data - different interpretation:
+	Local $tULONG = DllStructCreate("ULONG")
+	Local $tFloat = DllStructCreate("FLOAT", DllStructGetPtr($tULONG))
 
-    If $iExponent = -15 Then ; special case when exponent = 00000 defined in IEEE 754
-        $iExponent = -14
-        $fFraction = 0
-    EndIf
+	; extract components
+	Local Const $e = BitShift(BitAND($dBin, 0x7C00), 10) ; exponent
+	Local Const $m = BitShift(BitAND($dBin, 0x03FF), -13) ; mantissa
+	DllStructSetData($tFloat, 1, $m)
+	Local Const $v = BitShift(DllStructGetData($tULONG, 1), 23) ; leading zeros in denormalized format
 
-	; calculate the fraction:
-    For $i = 0 To 9
-        If BitAnd($iFraction, $iCurBitVal) Then
-			$fFraction += $fCurVal
-		EndIf
-		$fCurVal += $fCurVal
-		$iCurBitVal += $iCurBitVal
-	Next
+	; special case treatment (+-infinity, NaN)
+	If $e = 31 Then	Return $m = 0 _
+			? ($dBin > 0x8000 ? -1.0 / 0.0 : 1.0 / 0.0) _ ; +-infinity
+			: 0.0 / 0.0 ; NaN
 
-	Return ($iSign ? -1 : 1) * (2^$iExponent) * $fFraction
+	; the main conversion
+	DllStructSetData($tULONG, 1, BitOr( _
+		BitShift(BitAnd($dBin, 0x8000), -16), _
+		($e <> 0) * BitOr(BitShift($e + 112, -23), $m), _
+		BitAnd($e = 0, $m <> 0) * BitOr(BitShift($v - 37, -23), BitAnd(BitShift($m, 150 - $v), 0x007FE000) ) _
+	))
+
+	Return  DllStructGetData($tFloat, 1)
+EndFunc
+
+; take float variable and convert it to FP16-Format
+Func __cbor_FloatToFP16($vNumber)
+	; like a union in C: same data - different interpretation:
+	Local $tULONG = DllStructCreate("ULONG")
+	Local $tFloat = DllStructCreate("FLOAT", DllStructGetPtr($tULONG))
+
+	; convert input into a 32 Bit Float first (bit-operations in AutoIt can only handle 32 bit-values):
+	DllStructSetData($tFloat, 1, $vNumber)
+	Local $iNumber = DllStructGetData($tULONG, 1)
+
+	Local Const $b = $iNumber + 0x800 ; round-to-nearest-even: add last bit after truncated mantissa
+	Local Const $e = BitShift(BitAND($b, 0x7F800000), 23) ; exponent
+	Local Const $m = BitAND($b, 0x007FFFFF) ; mantissa; in line below: 0x007FF000 = 0x00800000-0x00001000 = decimal indicator flag - initial rounding
+
+	Local $iReturn = BitOR( _
+		BitShift(BitAnd($b, 0x80000000), 16), _
+		($e > 112) *  BitOr(BitAnd(BitShift($e - 112, -10), 0x7C00), BitShift($m, 13)), _
+		BitAnd($e < 113, $e > 101) *  BitShift(BitShift(0x007FF000 + $m, 125 - $e) + 1, 1), _
+		($e > 143) * 0x7FFF _
+	)
+	Return BinaryMid($iReturn, 1, 2)
 EndFunc
