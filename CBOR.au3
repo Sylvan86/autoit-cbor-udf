@@ -180,8 +180,6 @@ Func _cbor_encode($vObject)
 			Local $bString = StringToBinary($vObject, 4) ; must be UTF-8 in CBOR
 			Local $iBinLen = BinaryLen($bString)
 
-			If $iBinLen = 0 Then Return BinaryMid(0x60, 1, 1)
-
 			; build the whole element structure (initial element byte + size information + data)
 			Local $tRet = __cbor_encodeNum($iBinLen, 3, ";BYTE[" & $iBinLen & "]")
 			Local $iDataIndex = @extended > 0 ? 3 : 2
@@ -190,28 +188,9 @@ Func _cbor_encode($vObject)
 			Return __cbor_StructToBin($tRet)
 		Case "Int32", "Int64"
 			Local $bNeg = $vObject < 0 ? True : False
-
 			If $bNeg Then $vObject = -$vObject - 1
-			Local $bCborFirst = $bNeg ? 0x20 : 0x0
 
-			If $vObject < 24 Then
-				$bCborFirst += $vObject
-				Return BinaryMid($bCborFirst, 1, 1)
-			ElseIf $vObject < 0x101 Then  ; 1 Byte
-				$bCborFirst += 24
-				Local $tRet = DllStructCreate("BYTE;BYTE")
-			ElseIf $vObject < 0x10001 Then ; 2 Byte
-				$bCborFirst += 25
-				Local $tRet = DllStructCreate("BYTE;BYTE[2]")
-			ElseIf $vObject < 0x100000001 Then ; 4 Byte
-				$bCborFirst += 26
-				Local $tRet = DllStructCreate("BYTE;BYTE[4]")
-			Else ; 8 Byte
-				$bCborFirst += 27
-				Local $tRet = DllStructCreate("BYTE;BYTE[8]")
-			EndIf
-			DllStructSetData($tRet, 1, $bCborFirst)
-			DllStructSetData($tRet, 2, $vObject)
+			$tRet = __cbor_encodeNum($vObject, $bNeg ? 1 : 0)
 			Return __cbor_StructToBin($tRet)
 
 		Case "Float", "Double"
@@ -269,8 +248,6 @@ Func _cbor_encode($vObject)
 			Local $nElements = UBound($vObject)
 			Local $aBinElements[$nElements]
 			Local $bElement
-
-			If $nElements = 0 Then Return BinaryMid(0x80, 1, 1)
 
 			; encode all elements:
 			Local $tagElements = ""
@@ -531,30 +508,29 @@ Func __cbor_encodeNum($iNum, $iMajortype, $sTagAdditional = "")
 	;  encode the number of elements
 	Switch $iNum
 		Case 0 ; empty
-			Return SetExtended($iExt, BinaryMid($bCborFirst, 1, 1))
+			$tRet = DllStructCreate("BYTE")
 		Case 1 To 23 ; direct count
 			$bCborFirst += $iNum
 			$tRet = DllStructCreate("BYTE" & $sTagAdditional)
-			$iExt = 0
-		Case 24 To 0x100 ; 1 Byte
+		Case 24 To 255 ; 1 Byte
 			$bCborFirst += 24
 			$tRet = DllStructCreate("BYTE;BYTE" & $sTagAdditional)
 			DllStructSetData($tRet, 2, $iNum)
 			$iExt = 1
-		Case 0x101 To 0x10000 ; 2 Byte
+		Case 256 To 65535 ; 2 Byte
 			$bCborFirst += 25
 			$tRet = DllStructCreate("BYTE;BYTE[2]" & $sTagAdditional)
 			DllStructSetData($tRet, 2, __cbor_swapEndianess(BinaryMid($iNum, 1, 2)))
 			$iExt = 2
-		Case 0x10001 To 0x100000000 ; 4 Byte
+		Case 65536 To 4294967295 ; 4 Byte
 			$bCborFirst += 26
 			$tRet = DllStructCreate("BYTE;BYTE[4]" & $sTagAdditional)
-			DllStructSetData($tRet, 2, __cbor_swapEndianess(BinaryMid($iNum, 1, 2)))
+			DllStructSetData($tRet, 2, __cbor_swapEndianess(BinaryMid($iNum, 1, 4)))
 			$iExt = 4
 		Case Else ; 8 Byte
 			$bCborFirst += 27
 			$tRet = DllStructCreate("BYTE;BYTE[8]" & $sTagAdditional)
-			DllStructSetData($tRet, 2, __cbor_swapEndianess(BinaryMid($iNum, 1, 2)))
+			DllStructSetData($tRet, 2, __cbor_swapEndianess($iNum))
 			$iExt = 8
 	EndSwitch
 	DllStructSetData($tRet, 1, $bCborFirst)
