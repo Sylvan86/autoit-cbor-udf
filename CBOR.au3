@@ -106,9 +106,7 @@ Func _cbor_decode($dInput, $iCurPos = 1)
 			Local $mMap[], $vKey, $vVal
 			For $i = 0 To $iAddInfo - 1
 				$vKey = _cbor_decode($dInput, $dNextPos)
-				$dNextPos = @extended
-
-				$vVal = _cbor_decode($dInput, $dNextPos)
+				$vVal = _cbor_decode($dInput, @extended)
 				$dNextPos = @extended
 
 				$mMap[$vKey] = $vVal
@@ -272,8 +270,6 @@ Func _cbor_encode($vObject)
 		Case "Object"
 			If ObjName($vObject) = "Dictionary" Then
 				Local $nElements = $vObject.Count()
-				If $nElements = 0 Then Return BinaryMid(0xA0, 1, 1)
-
 				Local $aBinElements[$nElements][2]
 				Local $tRet, $vKey, $bKey, $bValue
 
@@ -311,9 +307,7 @@ Func _cbor_encode($vObject)
 		Case "Map"
 			Local $nElements = UBound($vObject)
 			Local $aBinElements[$nElements][2]
-			Local $tRet, $vKey, $bKey, $bValue
-
-			If $nElements = 0 Then Return BinaryMid(0xA0, 1, 1)
+			Local $tRet, $vKey, $bKey, $bValue, $i
 
 			; encode all elements:
 			Local $tagElements = "", $i = 0
@@ -341,6 +335,7 @@ Func _cbor_encode($vObject)
 			Next
 
 			Return __cbor_StructToBin($tRet)
+
 		Case Else
 			Return SetError(2, 0, Null)
 	EndSwitch
